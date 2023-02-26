@@ -61,7 +61,7 @@ def window_reverse(windows: torch.Tensor, window_size: int, H: int, W: int):
     Returns:
         x: (B, H, W, C)
     """
-    B = int(windows.shape[0] / (H * W / window_size / window_size))
+    B = windows.shape[0] // (H * W // window_size // window_size)
     x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
     return x
@@ -121,7 +121,7 @@ class WindowAttention(nn.Module):
         trunc_normal_(self.relative_position_bias_table, std=.02)
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
+    def forward(self, x: torch.Tensor, mask: torch.Tensor):
         """
         Args:
             x: input features with shape of (num_windows*B, N, C)
@@ -139,13 +139,10 @@ class WindowAttention(nn.Module):
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
         attn = attn + relative_position_bias.unsqueeze(0)
 
-        if mask is not None:
-            nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
-            attn = self.softmax(attn)
-        else:
-            attn = self.softmax(attn)
+        nW = mask.shape[0]
+        attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+        attn = attn.view(-1, self.num_heads, N, N)
+        attn = self.softmax(attn)
 
         attn = self.attn_drop(attn)
 
@@ -153,24 +150,6 @@ class WindowAttention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
-
-    @torch.jit.unused
-    def extra_repr(self) -> str:
-        return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}'
-
-    @torch.jit.unused
-    def flops(self, N):
-        # calculate flops for 1 window with token length of N
-        flops = 0
-        # qkv = self.qkv(x)
-        flops += N * self.dim * 3 * self.dim
-        # attn = (q @ k.transpose(-2, -1))
-        flops += self.num_heads * N * (self.dim // self.num_heads) * N
-        #  x = (attn @ v)
-        flops += self.num_heads * N * N * (self.dim // self.num_heads)
-        # x = self.proj(x)
-        flops += N * self.dim * self.dim
-        return flops
 
 
 class SwinTransformerBlock(nn.Module):
@@ -209,10 +188,6 @@ class SwinTransformerBlock(nn.Module):
         self.window_size = window_size
         self.shift_size = shift_size
         self.mlp_ratio = mlp_ratio
-        if min(self.input_resolution) <= self.window_size:
-            # if window size is larger than input resolution, we don't partition windows
-            self.shift_size = 0
-            self.window_size = min(self.input_resolution)
         assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
 
         self.norm1 = norm_layer(dim)
@@ -226,16 +201,15 @@ class SwinTransformerBlock(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
         if self.shift_size > 0:
-            attn_mask = self.calculate_mask(self.input_resolution)
+            H, W = self.input_resolution
+            img_mask = torch.zeros(1, H, W, 1)
+            attn_mask = self.calculate_mask(img_mask)
         else:
             attn_mask = None
 
         self.register_buffer("attn_mask", attn_mask)
 
-    def calculate_mask(self, x_size: Tuple[int, int]):
-        # calculate attention mask for SW-MSA
-        H, W = x_size
-        img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
+    def calculate_mask(self, img_mask: torch.Tensor):
         h_slices = ((0, -self.window_size),
                     (-self.window_size, -self.shift_size),
                     (-self.shift_size, None))
@@ -274,11 +248,8 @@ class SwinTransformerBlock(nn.Module):
         x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
 
-        # W-MSA/SW-MSA (to be compatible for testing on images whose shapes are the multiple of window size
-        if self.input_resolution == x_size:
-            attn_windows = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
-        else:
-            attn_windows = self.attn(x_windows, mask=self.calculate_mask(x_size).cuda())
+        img_mask = torch.zeros_like(shortcut[0, :, 0]).view(1, H, W, 1)
+        attn_windows = self.attn(x_windows, mask=self.calculate_mask(img_mask))
 
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
@@ -296,80 +267,6 @@ class SwinTransformerBlock(nn.Module):
         x = x + self.drop_path(self.mlp(self.norm2(x)))
 
         return x
-
-    @torch.jit.unused
-    def extra_repr(self) -> str:
-        return f"dim={self.dim}, input_resolution={self.input_resolution}, num_heads={self.num_heads}, " \
-               f"window_size={self.window_size}, shift_size={self.shift_size}, mlp_ratio={self.mlp_ratio}"
-
-    @torch.jit.unused
-    def flops(self):
-        flops = 0
-        H, W = self.input_resolution
-        # norm1
-        flops += self.dim * H * W
-        # W-MSA/SW-MSA
-        nW = H * W / self.window_size / self.window_size
-        flops += nW * self.attn.flops(self.window_size * self.window_size)
-        # mlp
-        flops += 2 * H * W * self.dim * self.dim * self.mlp_ratio
-        # norm2
-        flops += self.dim * H * W
-        return flops
-
-
-class PatchMerging(nn.Module):
-    r""" Patch Merging Layer.
-
-    Args:
-        input_resolution (tuple[int]): Resolution of input feature.
-        dim (int): Number of input channels.
-        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
-    """
-
-    input_resolution: Tuple[int, int]
-    dim: int
-
-    def __init__(self, input_resolution: Tuple[int, int], dim: int, norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.input_resolution = input_resolution
-        self.dim = dim
-        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
-        self.norm = norm_layer(4 * dim)
-
-    def forward(self, x: torch.Tensor):
-        """
-        x: B, H*W, C
-        """
-        H, W = self.input_resolution
-        B, L, C = x.shape
-        assert L == H * W, "input feature has wrong size"
-        assert modulo(H, 2) == 0 and modulo(W, 2) == 0, f"x size ({H}*{W}) are not even."
-
-        x = x.view(B, H, W, C)
-
-        x0 = x[:, 0::2, 0::2, :]  # B H/2 W/2 C
-        x1 = x[:, 1::2, 0::2, :]  # B H/2 W/2 C
-        x2 = x[:, 0::2, 1::2, :]  # B H/2 W/2 C
-        x3 = x[:, 1::2, 1::2, :]  # B H/2 W/2 C
-        x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
-        x = x.view(B, -1, 4 * C)  # B H/2*W/2 4*C
-
-        x = self.norm(x)
-        x = self.reduction(x)
-
-        return x
-
-    @torch.jit.unused
-    def extra_repr(self) -> str:
-        return f"input_resolution={self.input_resolution}, dim={self.dim}"
-
-    @torch.jit.unused
-    def flops(self):
-        H, W = self.input_resolution
-        flops = H * W * self.dim
-        flops += (H // 2) * (W // 2) * 4 * self.dim * 2 * self.dim
-        return flops
 
 
 class BasicLayer(nn.Module):
@@ -419,35 +316,10 @@ class BasicLayer(nn.Module):
                                  norm_layer=norm_layer)
             for i in range(depth)])
 
-        # patch merging layer
-        if downsample is not None:
-            self.downsample = downsample(input_resolution, dim=dim, norm_layer=norm_layer)
-        else:
-            self.downsample = None
-
     def forward(self, x: torch.Tensor, x_size: Tuple[int, int]):
         for blk in self.blocks:
             x = blk(x, x_size)
-#             if self.use_checkpoint:
-#                 x = checkpoint.checkpoint(blk, x, x_size)
-#             else:
-#                 x = blk(x, x_size)
-        if self.downsample is not None:
-            x = self.downsample(x)
         return x
-
-    @torch.jit.unused
-    def extra_repr(self) -> str:
-        return f"dim={self.dim}, input_resolution={self.input_resolution}, depth={self.depth}"
-
-    @torch.jit.unused
-    def flops(self):
-        flops = 0
-        for blk in self.blocks:
-            flops += blk.flops()
-        if self.downsample is not None:
-            flops += self.downsample.flops()
-        return flops
 
 
 class RSTB(nn.Module):
@@ -498,14 +370,11 @@ class RSTB(nn.Module):
                                          downsample=downsample,
                                          use_checkpoint=use_checkpoint)
 
-        if resi_connection == '1conv':
-            self.conv = nn.Conv2d(dim, dim, 3, 1, 1)
-        elif resi_connection == '3conv':
-            # to save parameters and memory
-            self.conv = nn.Sequential(nn.Conv2d(dim, dim // 4, 3, 1, 1), nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                                      nn.Conv2d(dim // 4, dim // 4, 1, 1, 0),
-                                      nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                                      nn.Conv2d(dim // 4, dim, 3, 1, 1))
+        # to save parameters and memory
+        self.conv = nn.Sequential(nn.Conv2d(dim, dim // 4, 3, 1, 1), nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                                  nn.Conv2d(dim // 4, dim // 4, 1, 1, 0),
+                                  nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                                  nn.Conv2d(dim // 4, dim, 3, 1, 1))
 
         self.patch_embed = PatchEmbed(
             img_size=img_size, patch_size=patch_size, in_chans=0, embed_dim=dim,
@@ -517,17 +386,6 @@ class RSTB(nn.Module):
 
     def forward(self, x: torch.Tensor, x_size: Tuple[int, int]):
         return self.patch_embed(self.conv(self.patch_unembed(self.residual_group(x, x_size), x_size))) + x
-
-    @torch.jit.unused
-    def flops(self):
-        flops = 0
-        flops += self.residual_group.flops()
-        H, W = self.input_resolution
-        flops += H * W * self.dim * self.dim * 9
-        flops += self.patch_embed.flops()
-        flops += self.patch_unembed.flops()
-
-        return flops
 
 
 class PatchEmbed(nn.Module):
@@ -572,14 +430,6 @@ class PatchEmbed(nn.Module):
             x = self.norm(x)
         return x
 
-    @torch.jit.unused
-    def flops(self):
-        flops = 0
-        H, W = self.img_size
-        if self.norm is not None:
-            flops += H * W * self.embed_dim
-        return flops
-
 
 class PatchUnEmbed(nn.Module):
     r""" Image to Patch Unembedding
@@ -616,61 +466,6 @@ class PatchUnEmbed(nn.Module):
         B, HW, C = x.shape
         x = x.transpose(1, 2).view(B, self.embed_dim, x_size[0], x_size[1])  # B Ph*Pw C
         return x
-
-    @torch.jit.unused
-    def flops(self):
-        flops = 0
-        return flops
-
-
-class Upsample(nn.Sequential):
-    """Upsample module.
-
-    Args:
-        scale (int): Scale factor. Supported scales: 2^n and 3.
-        num_feat (int): Channel number of intermediate features.
-    """
-
-    def __init__(self, scale: int, num_feat: int):
-        m = []
-        if (scale & (scale - 1)) == 0:  # scale = 2^n
-            for _ in range(int(math.log(scale, 2))):
-                m.append(nn.Conv2d(num_feat, 4 * num_feat, 3, 1, 1))
-                m.append(nn.PixelShuffle(2))
-        elif scale == 3:
-            m.append(nn.Conv2d(num_feat, 9 * num_feat, 3, 1, 1))
-            m.append(nn.PixelShuffle(3))
-        else:
-            raise ValueError(f'scale {scale} is not supported. ' 'Supported scales: 2^n and 3.')
-        super(Upsample, self).__init__(*m)
-
-
-class UpsampleOneStep(nn.Sequential):
-    """UpsampleOneStep module (the difference with Upsample is that it always only has 1conv + 1pixelshuffle)
-       Used in lightweight SR to save parameters.
-
-    Args:
-        scale (int): Scale factor. Supported scales: 2^n and 3.
-        num_feat (int): Channel number of intermediate features.
-
-    """
-
-    num_feat: int
-    input_resolution: Optional[Tuple[int, int]]
-
-    def __init__(self, scale: int, num_feat: int, num_out_ch: int, input_resolution=None):
-        self.num_feat = num_feat
-        self.input_resolution = input_resolution
-        m = []
-        m.append(nn.Conv2d(num_feat, (scale ** 2) * num_out_ch, 3, 1, 1))
-        m.append(nn.PixelShuffle(scale))
-        super(UpsampleOneStep, self).__init__(*m)
-
-    @torch.jit.unused
-    def flops(self):
-        H, W = self.input_resolution
-        flops = H * W * self.num_feat * 3 * 9
-        return flops
 
 
 class SwinIR(nn.Module):
@@ -724,11 +519,8 @@ class SwinIR(nn.Module):
         num_out_ch = in_chans
         num_feat = 64
         self.img_range = img_range
-        if in_chans == 3:
-            rgb_mean = (0.4488, 0.4371, 0.4040)
-            self.mean = torch.Tensor(rgb_mean).view(1, 3, 1, 1)
-        else:
-            self.mean = torch.zeros(1, 1, 1, 1)
+        rgb_mean = (0.4488, 0.4371, 0.4040)
+        self.mean = torch.Tensor(rgb_mean).view(1, 3, 1, 1)
         self.upscale = upscale
         self.upsampler = upsampler
         self.window_size = window_size
@@ -794,41 +586,24 @@ class SwinIR(nn.Module):
         self.norm = norm_layer(self.num_features)
 
         # build the last conv layer in deep feature extraction
-        if resi_connection == '1conv':
-            self.conv_after_body = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
-        elif resi_connection == '3conv':
-            # to save parameters and memory
-            self.conv_after_body = nn.Sequential(nn.Conv2d(embed_dim, embed_dim // 4, 3, 1, 1),
-                                                 nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                                                 nn.Conv2d(embed_dim // 4, embed_dim // 4, 1, 1, 0),
-                                                 nn.LeakyReLU(negative_slope=0.2, inplace=True),
-                                                 nn.Conv2d(embed_dim // 4, embed_dim, 3, 1, 1))
+        # to save parameters and memory
+        self.conv_after_body = nn.Sequential(nn.Conv2d(embed_dim, embed_dim // 4, 3, 1, 1),
+                                             nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                                             nn.Conv2d(embed_dim // 4, embed_dim // 4, 1, 1, 0),
+                                             nn.LeakyReLU(negative_slope=0.2, inplace=True),
+                                             nn.Conv2d(embed_dim // 4, embed_dim, 3, 1, 1))
 
         #####################################################################################################
         ################################ 3, high quality image reconstruction ################################
-        if self.upsampler == 'pixelshuffle':
-            # for classical SR
-            self.conv_before_upsample = nn.Sequential(nn.Conv2d(embed_dim, num_feat, 3, 1, 1),
-                                                      nn.LeakyReLU(inplace=True))
-            self.upsample = Upsample(upscale, num_feat)
-            self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
-        elif self.upsampler == 'pixelshuffledirect':
-            # for lightweight SR (to save parameters)
-            self.upsample = UpsampleOneStep(upscale, embed_dim, num_out_ch,
-                                            (patches_resolution[0], patches_resolution[1]))
-        elif self.upsampler == 'nearest+conv':
-            # for real-world SR (less artifacts)
-            self.conv_before_upsample = nn.Sequential(nn.Conv2d(embed_dim, num_feat, 3, 1, 1),
-                                                      nn.LeakyReLU(inplace=True))
-            self.conv_up1 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
-            if self.upscale == 4:
-                self.conv_up2 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
-            self.conv_hr = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
-            self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
-            self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
-        else:
-            # for image denoising and JPEG compression artifact reduction
-            self.conv_last = nn.Conv2d(embed_dim, num_out_ch, 3, 1, 1)
+        # for real-world SR (less artifacts)
+        self.conv_before_upsample = nn.Sequential(nn.Conv2d(embed_dim, num_feat, 3, 1, 1),
+                                                  nn.LeakyReLU(inplace=True))
+        self.conv_up1 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
+        if self.upscale == 4:
+            self.conv_up2 = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
+        self.conv_hr = nn.Conv2d(num_feat, num_feat, 3, 1, 1)
+        self.conv_last = nn.Conv2d(num_feat, num_out_ch, 3, 1, 1)
+        self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
 
         self.apply(self._init_weights)
 
@@ -840,21 +615,6 @@ class SwinIR(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
-
-    @torch.jit.unused
-    def no_weight_decay(self):
-        return {'absolute_pos_embed'}
-
-    @torch.jit.unused
-    def no_weight_decay_keywords(self):
-        return {'relative_position_bias_table'}
-
-    def check_image_size(self, x: torch.Tensor):
-        _, _, h, w = x.size()
-        mod_pad_h = modulo((self.window_size - modulo(h, self.window_size)), self.window_size)
-        mod_pad_w = modulo((self.window_size - modulo(w, self.window_size)), self.window_size)
-        x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h), 'reflect')
-        return x
 
     def forward_features(self, x: torch.Tensor):
         x_size = (x.shape[2], x.shape[3])
@@ -873,66 +633,19 @@ class SwinIR(nn.Module):
 
     def forward(self, x: torch.Tensor):
         H, W = x.shape[2:]
-        x = self.check_image_size(x)
 
         mean = self.mean.type_as(x)
         x = (x - mean) * self.img_range
 
-        # if self.upsampler == 'pixelshuffle':
-        # for classical SR
-        # x = self.conv_first(x)
-        # x = self.conv_after_body(self.forward_features(x)) + x
-        # x = self.conv_before_upsample(x)
-        # x = self.conv_last(self.upsample(x))
-        # elif self.upsampler == 'pixelshuffledirect':
-        # for lightweight SR
-        # x = self.conv_first(x)
-        # x = self.conv_after_body(self.forward_features(x)) + x
-        # x = self.upsample(x)
-        # elif self.upsampler == 'nearest+conv':
-        if self.upsampler == 'nearest+conv':
-            # for real-world SR
-            x = self.conv_first(x)
-            x = self.conv_after_body(self.forward_features(x)) + x
-            x = self.conv_before_upsample(x)
-            x = self.lrelu(self.conv_up1(torch.nn.functional.interpolate(x, scale_factor=2.0, mode='nearest')))
-            if self.upscale == 4:
-                x = self.lrelu(self.conv_up2(torch.nn.functional.interpolate(x, scale_factor=2.0, mode='nearest')))
-            x = self.conv_last(self.lrelu(self.conv_hr(x)))
-        else:
-            # for image denoising and JPEG compression artifact reduction
-            x_first = self.conv_first(x)
-            res = self.conv_after_body(self.forward_features(x_first)) + x_first
-            x = x + self.conv_last(res)
+        # for real-world SR
+        x = self.conv_first(x)
+        x = self.conv_after_body(self.forward_features(x)) + x
+        x = self.conv_before_upsample(x)
+        x = self.lrelu(self.conv_up1(torch.nn.functional.interpolate(x, scale_factor=(2.0, 2.0), mode='nearest')))
+        if self.upscale == 4:
+            x = self.lrelu(self.conv_up2(torch.nn.functional.interpolate(x, scale_factor=(2.0, 2.0), mode='nearest')))
+        x = self.conv_last(self.lrelu(self.conv_hr(x)))
 
         x = x / self.img_range + mean
 
         return x[:, :, :H*self.upscale, :W*self.upscale]
-
-    @torch.jit.unused
-    def flops(self):
-        flops = 0
-        H, W = self.patches_resolution
-        flops += H * W * 3 * self.embed_dim * 9
-        flops += self.patch_embed.flops()
-        for i, layer in enumerate(self.layers):
-            flops += layer.flops()
-        flops += H * W * 3 * self.embed_dim * self.embed_dim
-        flops += self.upsample.flops()
-        return flops
-
-
-# if __name__ == '__main__':
-#     upscale = 4
-#     window_size = 8
-#     height = (1024 // upscale // window_size + 1) * window_size
-#     width = (720 // upscale // window_size + 1) * window_size
-#     model = SwinIR(upscale=2, img_size=(height, width),
-#                    window_size=window_size, img_range=1., depths=[6, 6, 6, 6],
-#                    embed_dim=60, num_heads=[6, 6, 6, 6], mlp_ratio=2, upsampler='pixelshuffledirect')
-#     print(model)
-#     print(height, width, model.flops() / 1e9)
-
-#     x = torch.randn((1, 3, height, width))
-#     x = model(x)
-#     print(x.shape)
